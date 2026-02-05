@@ -1,89 +1,106 @@
-from fastapi import Body, HTTPException, FastAPI
+from fastapi import Body, FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from database import SessionLocal, engine
+from models import Base, User
 from validators.signup_validate import validate_email, validate_password, validate_username
-from users_db import users
-from passlib.context import CryptContext 
-import hashlib
-import base64
+from utils.security import hash_password, verify_password
+from auth import create_access_token, get_current_user
 
 app = FastAPI()
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+Base.metadata.create_all(bind=engine)
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
-def get_password_hash_input(password: str) -> str:
-    # 1. Hash with SHA-256 to get a fixed-length output
-    sha_hash = hashlib.sha256(password.encode("utf-8")).digest()
-    # 2. Base64 encode it so it's a string Bcrypt can handle
-    return base64.b64encode(sha_hash).decode("ascii")
+# DB dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-@app.post("/signup", description="Provide email, username, and password to signup")
-async def signup(
-    user: dict = Body(..., example={"email": "test@gmail.com","username":"debs_01","password":"Pass123!"})
-):
 
-    email=user.get("email","")
-    username=user.get("username","")
-    password=user.get("password","")
+@app.post("/signup", description="Signup with email, username, and password")
 
-    email_error = validate_email(email)
-    password_error = validate_password(password)
-    username_error = validate_username(username)
+def signup( user: dict = Body(
+        ...,
+        example={
+            "email": "user@example.com",
+            "username": "exampleuser",
+            "password": "securepassword123"
+        }
+    ), db: Session = Depends(get_db)):
 
-    for error in [email_error, username_error, password_error]:
+    email = user.get("email", "")
+    username = user.get("username", "")
+    password = user.get("password", "")
+
+    for error in [
+        validate_email(email),
+        validate_username(username),
+        validate_password(password)
+    ]:
         if error:
             raise HTTPException(status_code=400, detail=error)
 
-    
-    for u in users.values():
-        if u["email"] == email:
-            raise HTTPException(status_code=400, detail="Email already exists")
-        if u["username"] == username:
-            raise HTTPException(status_code=400, detail="Username already exists")
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(status_code=400, detail="Email already exists")
 
-    prep_password = get_password_hash_input(password)
-    hashed_password = pwd_context.hash(prep_password)
+    if db.query(User).filter(User.username == username).first():
+        raise HTTPException(status_code=400, detail="Username already exists")
 
-    users[username]={
-  "email": email,
-  "username": username,
-  "password": hashed_password
-}
-    
+    new_user = User(
+        email=email,
+        username=username,
+        hashed_password=hash_password(password)
+    )
+
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
     return {"message": "Signup successful"}
 
 
-@app.post("/login", description="Provide email/username and password to login")
-async def login(
-    user: dict = Body(
-        ...,
-        example={
-            "login": "debs_01 or test@gmail.com",
-            "password": "Pass123!"
-        }
-    )
+
+@app.post("/login", description="Login with email/username and password")
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
 ):
-    login_input=user.get("login","")
-    password_input=user.get("password","")
+    user = db.query(User).filter(
+        (User.email == form_data.username) |
+        (User.username == form_data.username)
+    ).first()
 
-    if not login_input:
-        raise HTTPException(status_code=400, detail="Email/Username is required")
-    if not password_input:
-        raise HTTPException(status_code=400, detail="Password is required")
+    if not user:
+      raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
-    found_user = None
-    for u in users.values():
-        if u["email"] == login_input or u["username"] == login_input:
-            found_user = u
-            break
 
-    if not found_user:
-        raise HTTPException(status_code=400, detail="Invalid email/username or password")
+    if not verify_password(form_data.password, user.hashed_password):
+      raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid password")
 
-    prep_input = get_password_hash_input(password_input)
-    if not pwd_context.verify(prep_input, found_user["password"]):
-        raise HTTPException(status_code=400, detail="Invalid email/username or password")
+   
+    access_token = create_access_token(data={"sub": str(user.id)})
 
-    return {"message": "Login successful"}
+    return {
+        "message": "Login successful",
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
+
+
+
+@app.get("/me")
+def read_me(current_user: User = Depends(get_current_user)):
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "username": current_user.username
+    }
 
 if __name__ == "__main__":
     import uvicorn
